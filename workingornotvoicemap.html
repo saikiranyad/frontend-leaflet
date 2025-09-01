@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Live Routing with Voice (Plain JS)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    Leaflet CSS
+   <!-- Leaflet CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<!-- Leaflet Routing Machine CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css">
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+        }
+
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+
+        .controls {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: 320px;
+            max-width: calc(100vw - 24px);
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .row>* {
+            flex: 1;
+        }
+
+        input[type="text"] {
+            padding: 8px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        button {
+            padding: 8px 10px;
+            border: 1px solid #d1d5db;
+            background: #111827;
+            color: white;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        button.secondary {
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        .suggestions {
+            max-height: 180px;
+            overflow: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            background: white;
+        }
+
+        .suggestions div {
+            padding: 8px 10px;
+            cursor: pointer;
+        }
+
+        .suggestions div:hover {
+            background: #f3f4f6;
+        }
+
+        .status {
+            font-size: 12px;
+            color: #374151;
+        }
+
+        /* Hide LRM side panel; we handle UI ourselves */
+        .leaflet-routing-container {
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="controls" role="region" aria-label="Navigation controls">
+        <div class="row">
+            <input id="search" type="text" placeholder="Search destination..." aria-label="Search destination"
+                autocomplete="off" />
+            <button id="goBtn" title="Set destination">Go</button>
+        </div>
+        <div id="suggestions" class="suggestions" hidden></div>
+        <div class="row">
+            <button id="voiceBtn" class="secondary" title="Toggle voice guidance">Voice: On</button>
+            <button id="locateBtn" class="secondary" title="Recenter to your location">Locate me</button>
+        </div>
+        <div id="status" class="status" aria-live="polite">Waiting for your location…</div>
+    </div>
+
+    <div id="map" role="application" aria-label="Map"></div>
+
+    Leaflet JS
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Leaflet Routing Machine + OSRMv1 -->
+<script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.min.js"></script>
+    <script>
+        // Map setup
+        const map = L.map('map', { zoomControl: true });
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors',
+            maxZoom: 19
+        }).addTo(map);
+
+        // State
+        let currentPos = null;
+        let currentMarker = null;
+        let destPos = null;
+        let destMarker = null;
+
+        let voiceOn = true;
+        let routeCtrl = null;
+        let routeData = null;   // Latest route from routesfound
+        let nextStepIdx = 0;
+        let lastSpokenStepIdx = -1;
+        let lastRerouteTs = 0;
+
+        const statusEl = document.getElementById('status');
+        const voiceBtn = document.getElementById('voiceBtn');
+        const locateBtn = document.getElementById('locateBtn');
+        const searchInput = document.getElementById('search');
+        const goBtn = document.getElementById('goBtn');
+        const suggestionsEl = document.getElementById('suggestions');
+
+        function setStatus(msg) { statusEl.textContent = msg; }
+
+        // Speech
+        function canSpeak() { return 'speechSynthesis' in window; }
+        function speak(text) {
+            if (!voiceOn || !canSpeak()) return;
+            try {
+                window.speechSynthesis.cancel();
+                const u = new SpeechSynthesisUtterance(text);
+                u.lang = 'en-US';
+                window.speechSynthesis.speak(u);
+            } catch (_) { }
+        }
+
+        function metersToHuman(m) {
+            if (m >= 1000) return (m / 1000).toFixed(1) + ' km';
+            return Math.round(m) + ' m';
+        }
+        function secondsToMinutes(s) {
+            const mins = Math.round(s / 60);
+            return mins <= 1 ? '1 minute' : mins + ' minutes';
+        }
+
+        // Routing control (lazy init)
+        function ensureRoutingControl() {
+            if (routeCtrl) return;
+            routeCtrl = L.Routing.control({
+                router: L.Routing.osrmv1({
+                    serviceUrl: 'https://router.project-osrm.org/route/v1',
+                    profile: 'driving' // change to 'foot' or 'bike' if needed
+                }),
+                waypoints: [],
+                addWaypoints: false,
+                routeWhileDragging: false,
+                fitSelectedRoutes: true,
+                show: false
+            })
+                .on('routesfound', (e) => {
+                    const route = e.routes[0];
+                    routeData = route;
+                    nextStepIdx = 0;
+                    lastSpokenStepIdx = -1;
+
+                    const dist = route.summary?.totalDistance ?? 0;
+                    const dur = route.summary?.totalTime ?? 0;
+                    const msg = `Route ready: ${metersToHuman(dist)}, about ${secondsToMinutes(dur)}.`;
+                    setStatus(msg);
+                    speak(msg);
+                })
+                .on('routingerror', () => {
+                    setStatus('Routing error. Trying again…');
+                })
+                .addTo(map);
+        }
+
+        // Throttled re-route from current position
+        function rerouteIfNeeded() {
+            if (!currentPos || !destPos) return;
+            const now = Date.now();
+            if (now - lastRerouteTs < 5000) return; // throttle every 5s
+            lastRerouteTs = now;
+
+            ensureRoutingControl();
+            routeCtrl.setWaypoints([
+                L.latLng(currentPos.lat, currentPos.lng),
+                L.latLng(destPos.lat, destPos.lng)
+            ]);
+        }
+
+        // Continuous location
+        function startGeolocation() {
+            if (!('geolocation' in navigator)) {
+                setStatus('Geolocation not supported by this browser.');
+                return;
+            }
+            navigator.geolocation.watchPosition(
+                (pos) => {
+                    const { latitude, longitude } = pos.coords;
+                    currentPos = { lat: latitude, lng: longitude };
+
+                    if (!currentMarker) {
+                        currentMarker = L.marker([latitude, longitude], { title: 'You are here' }).addTo(map);
+                        map.setView([latitude, longitude], 15);
+                        setStatus('Location acquired. Set a destination to start navigation.');
+                    } else {
+                        currentMarker.setLatLng([latitude, longitude]);
+                    }
+
+                    // As you move, check next step and update route periodically
+                    announceStepIfClose();
+                    rerouteIfNeeded();
+                },
+                (err) => setStatus('Location error: ' + err.message),
+                { enableHighAccuracy: true, maximumAge: 3000, timeout: 20000 }
+            );
+        }
+
+        // Announce the next step when you are close to it
+        function announceStepIfClose() {
+            if (!routeData || !currentPos) return;
+            const steps = routeData.instructions || [];
+            if (!steps.length) return;
+
+            if (nextStepIdx < 0) nextStepIdx = 0;
+            if (nextStepIdx >= steps.length) return;
+
+            const step = steps[nextStepIdx];
+            const coords = routeData.coordinates || [];
+            const coordIndex = Math.min(step.index || 0, coords.length - 1);
+            const stepCoord = coords[coordIndex];
+            if (!stepCoord) return;
+
+            const dist = L.latLng(currentPos.lat, currentPos.lng)
+                .distanceTo(L.latLng(stepCoord.lat, stepCoord.lng));
+
+            // Speak when within ~50 meters of the next instruction
+            if (dist < 50 && lastSpokenStepIdx !== nextStepIdx) {
+                speak(step.text || 'Continue');
+                lastSpokenStepIdx = nextStepIdx;
+                nextStepIdx += 1;
+            }
+        }
+
+        // Destination helpers
+        function setDestination(lat, lng, label) {
+            destPos = { lat, lng };
+            if (!destMarker) {
+                destMarker = L.marker([lat, lng], { title: label || 'Destination' }).addTo(map);
+            } else {
+                destMarker.setLatLng([lat, lng]);
+            }
+            if (label) destMarker.bindPopup(label);
+            rerouteIfNeeded();
+        }
+
+        // Nominatim search
+        let fetchAbort = null;
+        async function searchPlaces(query) {
+            if (fetchAbort) fetchAbort.abort();
+            fetchAbort = new AbortController();
+
+            const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=8&q=${encodeURIComponent(query)}`;
+            const res = await fetch(url, { signal: fetchAbort.signal, headers: { Accept: 'application/json' } });
+            if (!res.ok) return [];
+            const data = await res.json();
+            return (data || []).map(item => ({
+                displayName: item.display_name,
+                lat: parseFloat(item.lat),
+                lon: parseFloat(item.lon),
+            }));
+        }
+
+        function clearSuggestions() {
+            suggestionsEl.innerHTML = '';
+            suggestionsEl.hidden = true;
+        }
+
+        function showSuggestions(items) {
+            if (!items.length) return clearSuggestions();
+            suggestionsEl.innerHTML = '';
+            items.forEach((it) => {
+                const row = document.createElement('div');
+                row.textContent = it.displayName;
+                row.setAttribute('role', 'option');
+                row.addEventListener('click', () => {
+                    searchInput.value = it.displayName;
+                    clearSuggestions();
+                    setDestination(it.lat, it.lon, it.displayName);
+                    map.panTo([it.lat, it.lon]);
+                });
+                suggestionsEl.appendChild(row);
+            });
+            suggestionsEl.hidden = false;
+        }
+
+        // UI events
+        voiceBtn.addEventListener('click', () => {
+            voiceOn = !voiceOn;
+            voiceBtn.textContent = 'Voice: ' + (voiceOn ? 'On' : 'Off');
+            voiceBtn.setAttribute('aria-pressed', String(voiceOn));
+            setStatus('Voice guidance ' + (voiceOn ? 'enabled' : 'disabled') + '.');
+        });
+
+        locateBtn.addEventListener('click', () => {
+            if (currentPos) {
+                map.setView([currentPos.lat, currentPos.lng], Math.max(map.getZoom(), 15));
+            }
+        });
+
+        let suggestTimer = null;
+        searchInput.addEventListener('input', () => {
+            const q = searchInput.value.trim();
+            if (q.length < 3) return clearSuggestions();
+            if (suggestTimer) clearTimeout(suggestTimer);
+            suggestTimer = setTimeout(async () => {
+                try {
+                    const results = await searchPlaces(q);
+                    showSuggestions(results);
+                } catch { /* ignore */ }
+            }, 250);
+        });
+
+        goBtn.addEventListener('click', async () => {
+            const q = searchInput.value.trim();
+            if (!q) return;
+            try {
+                const [first] = await searchPlaces(q);
+                if (first) {
+                    setDestination(first.lat, first.lon, first.displayName);
+                    map.panTo([first.lat, first.lon]);
+                } else {
+                    setStatus('No results found.');
+                }
+            } catch {
+                setStatus('Search failed. Try again.');
+            }
+        });
+
+        // Init
+        setStatus('Initializing map and locating you…');
+        map.setView([20.5937, 78.9629], 5); // fallback view (India center, like your original)
+        startGeolocation();
+    </script>
+</body>
+
+</html>
